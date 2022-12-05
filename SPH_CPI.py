@@ -6,6 +6,7 @@ Further, this script also contains the implementation of the baseline Random For
 """
 
 import logging
+import time
 import warnings
 from abc import abstractmethod
 from collections import Counter
@@ -13,8 +14,8 @@ from collections import Counter
 from anytree import PreOrderIter
 from boruta import BorutaPy
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.impute import KNNImputer
-from sklearn.metrics import  top_k_accuracy_score
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.metrics import top_k_accuracy_score
 import numpy as np
 from sklearn.pipeline import Pipeline
 import concentrationMetrics as cm
@@ -23,7 +24,9 @@ import pandas as pd
 from Hierarchy import HardCodedHierarchy
 
 random_forest_parameters = {'random_state': 1234,
-                            'n_estimators': 200,
+                            'n_estimators': 50,
+                            'verbose': 100,
+                            'max_depth': 10,
                             # 'n_jobs': -1
                             }
 
@@ -54,11 +57,30 @@ class StatisticTracker:
         self.sph_count = 0
         self.cpi_count = 0
 
+        self.sph_time = 0
+        self.cpi_time = 0
+        self.model_training_time = 0
+        self.boruta_time = 0
+        self.prediction_time = 0
+        self.knn_training_time = 0
+
         # keep track of predictions, i.e., which sample with its group and class was predicted correctly at which position
         self.predictions = []
 
         # keep track of surrogate sets for SPH/ SPH+CPI
         self.surrogate_sets = []
+
+    def set_sph_time(self, sph_time):
+        self.sph_time = sph_time
+
+    def add_model_training_time(self, model_time):
+        self.model_training_time += model_time
+
+    def add_boruta_training_time(self, boruta_time):
+        self.boruta_time += boruta_time
+
+    def add_cpi_time(self, cpi_time):
+        self.cpi_time += cpi_time
 
     def track(self, partitions_for_node, partition):
         if not partition:
@@ -66,7 +88,7 @@ class StatisticTracker:
             partitions_for_node = {"node": {"data": partitions_for_node[0], "labels": partitions_for_node[1]}}
 
         # count number of partitions --> if we have a tuple we count the length of it!
-        #n_partitions = sum([len(x) if isinstance(x, tuple) else 1 for x in partitions_for_node.values()])
+        # n_partitions = sum([len(x) if isinstance(x, tuple) else 1 for x in partitions_for_node.values()])
         n_partitions = 0
 
         for partition_key, partition in partitions_for_node.items():
@@ -161,6 +183,12 @@ class StatisticTracker:
 
     def get_surrogates_df(self):
         return pd.DataFrame({"surrogate": self.surrogate_sets})
+
+    def set_prediction_time(self, prediction_time):
+        self.prediction_time = prediction_time
+
+    def add_knn_time(self, knn_time):
+        self.knn_training_time += knn_time
 
 
 class ClassificationMethod:
@@ -262,11 +290,26 @@ class ClassificationMethod:
         df["Run"] = self.run_id
         return df
 
+    def get_runtime_information_df(self):
+        runtime_info = {"Method": [self.name()],
+                        "SPH time": [self.stats_tracker.sph_time],
+                        "CPI time": [self.stats_tracker.cpi_time],
+                        "KNN training time": [self.stats_tracker.knn_training_time],
+                        "Model Training time": [self.stats_tracker.model_training_time],
+                        # "Boruta time": [self.stats_tracker.boruta_time]
+                        }
+        runtime_df = pd.DataFrame(data=runtime_info)
+        self._add_parameters_method_run(runtime_df)
+        return runtime_df
+
 
 class RandomForestClassMethod(ClassificationMethod):
     def __init__(self, classifier=RandomForestClassifier,
                  classifier_params=random_forest_parameters,
-                 partitioning=False, hierarchy_required=False, hierarchy=None, run_id=1):
+                 partitioning=False,
+                 hierarchy_required=False,
+                 hierarchy=None,
+                 run_id=1):
         super(RandomForestClassMethod, self).__init__(classifier=classifier,
                                                       classifier_params=classifier_params,
                                                       partitioning=partitioning, hierarchy_required=hierarchy_required,
@@ -278,13 +321,22 @@ class RandomForestClassMethod(ClassificationMethod):
 
     def fit(self, X_train, y_train):
         self.partitions_for_node = (X_train, y_train)
+        print("Running KNN Imputation")
+        knn_start = time.time()
         imp = KNNImputer(missing_values=np.nan)
         X_train = imp.fit_transform(X_train)
         self.imp = imp
+        knn_time = time.time() - knn_start
+        print(f"Finished KNN Imputation, took {knn_time}s")
+        self.stats_tracker.add_knn_time(knn_time)
         return self._fit_clf(X_train, y_train)
 
     def _fit_clf(self, X_train, y_train):
-        return self.classifier.fit(X_train, y_train)
+        model_start = time.time()
+        fitted_clf = self.classifier.fit(X_train, y_train)
+        model_time = time.time() - model_start
+        self.stats_tracker.add_model_training_time(model_time)
+        return fitted_clf
 
     def predict(self, df_test, **kwargs):
         df_test_numeric = df_test.select_dtypes(include=np.float)
@@ -297,7 +349,11 @@ class RandomForestClassMethod(ClassificationMethod):
         df_test_numeric = df_test.select_dtypes(include=np.float)
         X_test = df_test_numeric[[f"F{i}" for i in range(df_test_numeric.shape[1])]].to_numpy()
         X_test = self.imp.transform(X_test)
+
+        pred_start = time.time()
         y_pred = self.classifier.predict_proba(X_test)
+        prediction_time = time.time() - pred_start
+        self.stats_tracker.set_prediction_time(prediction_time)
         y_true = df_test['target'].to_numpy()
 
         self.stats_tracker.add_predictions(y_pred, y_true, e, df_test["group"], self.classifier.classes_)
@@ -320,11 +376,15 @@ class RandomForestBorutaMethod(RandomForestClassMethod):
         X_train = imp.fit_transform(X_train)
         self.imp = imp
 
+        boruta_start = time.time()
         feat_selector = BorutaPy(self.classifier, n_estimators='auto', max_iter=100, verbose=2, random_state=1)
         feat_selector.fit(X_train, y_train)
         self.feat_selector = feat_selector
         X_train = feat_selector.transform(X_train, weak=True)
+        boruta_time = time.time() - boruta_start
         print(f"selected feature shape: {X_train.shape}")
+        self.stats_tracker.add_boruta_training_time(boruta_time)
+        print(f"Training Time for Boruta is: {boruta_time}")
 
         return super().fit(X_train, y_train)
 
@@ -365,6 +425,7 @@ class SPH(ClassificationMethod):
         self.surrogate_sets = []
 
     def _run_sph(self):
+        sph_start = time.time()
         root_node = self.hierarchy
         partitions_for_node = {}
 
@@ -402,6 +463,9 @@ class SPH(ClassificationMethod):
                     partitions_for_node[node_id] = {"data": sph_data, "labels": sph_labels}
 
         self.stats_tracker.sph_count += sph_executed
+        sph_time = time.time() - sph_start
+        self.stats_tracker.set_sph_time(sph_time)
+
         return partitions_for_node, sph_executed
 
     def _SPH_checks(self, group_data, group_labels, min_samples_per_class=1, max_info_loss=0.25):
@@ -523,7 +587,12 @@ class SPH(ClassificationMethod):
             estimator = Pipeline([("imputer", KNNImputer(missing_values=np.nan)),
                                   ("forest", RandomForestClassifier(**random_forest_parameters))])
             print(f"Training RF on node {node_id}")
+
+            model_start = time.time()
             estimator.fit(node_data, node_labels)
+            model_training_time = time.time() - model_start
+            self.stats_tracker.add_model_training_time(model_training_time)
+
             model_repository[node_id] = estimator
 
         return model_repository
@@ -587,7 +656,12 @@ class SPHandCPI(SPH):
 
                 majority_estimator = Pipeline([("imputer", KNNImputer(missing_values=np.nan)),
                                                ("forest", RandomForestClassifier(**random_forest_parameters))])
+
+                model_start = time.time()
                 majority_estimator.fit(majority_partition, majority_labels)
+                model_time = time.time() - model_start
+                self.stats_tracker.add_model_training_time(model_time)
+
                 model_repository[node_id] = (minority_estimator, majority_estimator)
 
                 partitions_for_node[node_id] = ({"data": minority_partition,
@@ -596,13 +670,18 @@ class SPHandCPI(SPH):
             else:
                 estimator = Pipeline([("imputer", KNNImputer(missing_values=np.nan)),
                                       ("forest", RandomForestClassifier(**random_forest_parameters))])
+                model_start = time.time()
                 estimator.fit(cpi_data, cpi_labels)
+                model_time = time.time() - model_start
+                self.stats_tracker.add_model_training_time(model_time)
+
                 model_repository[node_id] = estimator
 
         self.partitions_for_node = partitions_for_node
         self.model_repository = model_repository
 
     def _run_cpi(self, partition_data, partition_labels):
+        cpi_start = time.time()
         ############# Detector: Check if gini threshold reached ###################################################
         # We now call gini function to calculate gini index
         gini_value = gini(partition_labels)
@@ -654,9 +733,13 @@ class SPHandCPI(SPH):
             # We use tuples with minority on first and majority on second position
             cpi_data = (minority_data, majority_data)
             cpi_labels = (minority_labels, majority_labels)
+            cpi_time = time.time() - cpi_start
+            self.stats_tracker.add_cpi_time(cpi_time)
             return cpi_data, cpi_labels
 
         else:
+            cpi_time = time.time() - cpi_start
+            self.stats_tracker.add_cpi_time(cpi_time)
             return partition_data, partition_labels
 
     def predict_test_samples(self, df_test, e=10):
